@@ -151,8 +151,7 @@ func (r *Ring[T]) DropPeek() (peek T, more, closed bool) {
 	defer r.mu.Unlock()
 	r.waitN(0)
 
-	more = r.l > 0
-	if more {
+	if r.l > 0 {
 		r.elems[r.head] = peek // reset to default
 		r.head = (r.head + 1) % len(r.elems)
 		r.l--
@@ -160,7 +159,7 @@ func (r *Ring[T]) DropPeek() (peek T, more, closed bool) {
 			r.c.Signal()
 		}
 	}
-	return r.elems[r.head], more, r.dead
+	return r.elems[r.head], r.l > 0, r.dead
 }
 
 func (r *Ring[T]) waitN(n int) {
