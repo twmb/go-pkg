@@ -10,7 +10,7 @@ func TestGet2x(t *testing.T) {
 	var c Cache[string, int]
 
 	{
-		i, _ := c.Get("foo", func() (int, error) {
+		i, _, _ := c.Get("foo", func() (int, error) {
 			return 3, nil
 		})
 		if i != 3 {
@@ -19,7 +19,7 @@ func TestGet2x(t *testing.T) {
 	}
 
 	{
-		i, _ := c.Get("foo", func() (int, error) {
+		i, _, _ := c.Get("foo", func() (int, error) {
 			panic("should have been cached")
 		})
 		if i != 3 {
@@ -39,7 +39,7 @@ func TestCollapsedGet(t *testing.T) {
 	)
 	for i := 0; i < niter; i++ {
 		go func() {
-			p, _ := c.Get("foo", func() (*int, error) {
+			p, _, _ := c.Get("foo", func() (*int, error) {
 				if atomic.AddInt64(&calls, 1) != 1 {
 					t.Error("closure called multiple times")
 				}
