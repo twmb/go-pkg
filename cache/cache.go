@@ -133,27 +133,33 @@ func New[K comparable, V any](opts ...Opt) *Cache[K, V] {
 // if the key is not yet cached. If stale values are enabled, the currently
 // cached value has an error, and there is an unexpired stale value, this
 // returns the stale value and no error.
-func (c *Cache[K, V]) Get(k K, miss func() (V, error)) (V, error) {
+func (c *Cache[K, V]) Get(k K, miss func() (V, error)) (v V, err error, hit bool) {
 	r := c.read()
 	e := r.m[k]
-	if e != nil && !e.expired(now()) {
-		return e.get()
+	if v, err, hit = e.get(); hit {
+		return
 	}
 
+	// We missed in the read map. We lock and check again to guard against
+	// something concurrent. Odds are we are falling into the logic below.
 	c.mu.Lock()
 	r = c.read()
 	e = r.m[k]
-	if e != nil && !e.expired(now()) {
+	if v, err, hit = e.get(); hit {
 		c.mu.Unlock()
-		return e.get()
+		return
 	}
 
-	if r.incomplete {
+	// We could have an entry in our read map that was deleted and has not
+	// yet gone through the promote&clear process. We only check the dirty
+	// map if the entry is nil.
+	if e == nil && r.incomplete {
 		e = c.dirty[k]
 		c.missed(r)
-		if e != nil && !e.expired(now()) {
+		r = c.read()
+		if v, err, hit = e.get(); hit {
 			c.mu.Unlock()
-			return e.get()
+			return
 		}
 	}
 
@@ -162,31 +168,41 @@ func (c *Cache[K, V]) Get(k K, miss func() (V, error)) (V, error) {
 		done:     make(chan struct{}),
 		override: make(chan V),
 	}
-	e = &ent[V]{
-		p:     unsafe.Pointer(loading),
-		stale: e.maybeNewStale(c.cfg.maxStaleAge),
+
+	// If we have no entry, this is completely new. If we had an entry, it
+	// was in the read map and not yet deleted through promotion. We know
+	// the pointer is not promotingDelete, since that is only set while
+	// promoting which requires the cache lock which we have right now.
+	//
+	// In the worst case we race with a concurrent Set and we override its
+	// results.
+	if e != nil {
+		atomic.StorePointer(&e.p, unsafe.Pointer(loading))
+	} else {
+		e = &ent[V]{
+			p:     unsafe.Pointer(loading),
+			stale: e.maybeNewStale(c.cfg.maxStaleAge),
+		}
+		c.storeDirty(r, k, e)
 	}
-	c.storeDirty(r, k, e)
 	c.mu.Unlock()
 
 	c.loadEnt(k, e, loading, func() (V, error) {
 		done := make(chan struct{})
-		var v V
-		var err error
 		go func() {
 			defer close(done)
 			v, err = miss()
 		}()
 
 		select {
-		case o := <-loading.override:
-			return o, nil
+		case v = <-loading.override:
+			return v, nil
 		case <-done:
 			return v, err
 		}
 	})
-
-	return e.get()
+	<-loading.done
+	return
 }
 
 func (c *Cache[K, V]) tryLoadEnt(k K, dirty func()) *ent[V] {
@@ -217,10 +233,12 @@ func (c *Cache[K, V]) TryGet(k K) (V, error, bool) {
 	return e.tryGet()
 }
 
-// Delete deletes the value for a key.
-func (c *Cache[K, V]) Delete(k K) {
+// Delete deletes the value for a key and returns the prior value, if loaded
+// (i.e. the return from TryGet).
+func (c *Cache[K, V]) Delete(k K) (V, error, bool) {
 	e := c.tryLoadEnt(k, func() { delete(c.dirty, k) })
-	e.del()
+	defer e.del()
+	return e.tryGet()
 }
 
 // Expire sets a loaded value to expire immediately, meaning the next Get will
@@ -321,12 +339,12 @@ func (c *Cache[K, V]) Set(k K, v V) {
 	r := c.read()
 	if e, ok := r.m[k]; ok {
 		for {
-			p := atomic.LoadPointer(&e.p)
-			if p == promotingDelete { // deleted & currently being ignored in a promote
+			rm := atomic.LoadPointer(&e.p)
+			if rm == promotingDelete { // deleted & currently being ignored in a promote
 				break
 			}
-			was = p
-			if atomic.CompareAndSwapPointer(&e.p, p, p) {
+			was = rm
+			if atomic.CompareAndSwapPointer(&e.p, rm, p) {
 				return
 			}
 		}
@@ -335,9 +353,9 @@ func (c *Cache[K, V]) Set(k K, v V) {
 	c.mu.Lock()
 	r = c.read()
 	if e := r.m[k]; e != nil {
-		was = atomic.SwapPointer(&e.p, unsafe.Pointer(p))
+		was = atomic.SwapPointer(&e.p, p)
 	} else if e := c.dirty[k]; e != nil {
-		was = atomic.SwapPointer(&e.p, unsafe.Pointer(p))
+		was = atomic.SwapPointer(&e.p, p)
 	} else {
 		c.storeDirty(r, k, &ent[V]{p: p})
 	}
@@ -458,6 +476,9 @@ func pointerToLoad[V any](p unsafe.Pointer) (*loading[V], *loaded[V]) {
 }
 
 func (e *ent[V]) load() (*loading[V], *loaded[V]) {
+	if e == nil {
+		return nil, nil
+	}
 	p := atomic.LoadPointer(&e.p)
 	if p == nil || p == promotingDelete {
 		return nil, nil
@@ -511,19 +532,22 @@ func (e *ent[V]) maybeNewStale(age time.Duration) *stale[V] {
 // get always returns the value or the stale value. We do not check if our
 // value is expired: we call this at the end of Get, we must always return
 // something even if it is to be immediately expired.
-func (e *ent[V]) get() (V, error) {
+func (e *ent[V]) get() (v V, err error, got bool) {
 	loading, loaded := e.load()
 	if loading != nil {
 		if e.stale != nil && !e.stale.expired(now()) {
-			return e.stale.v, nil
+			return e.stale.v, nil, true
 		}
 		<-loading.done
 		_, loaded = e.load()
 	}
-	if loaded.err != nil && e.stale != nil && !e.stale.expired(now()) {
-		return e.stale.v, nil
+	if loaded == nil {
+		return
 	}
-	return loaded.v, loaded.err
+	if loaded.err != nil && e.stale != nil && !e.stale.expired(now()) {
+		return e.stale.v, nil, true
+	}
+	return loaded.v, loaded.err, true
 }
 
 func (e *ent[V]) tryGet() (v V, err error, b bool) {
