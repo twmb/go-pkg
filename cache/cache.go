@@ -15,6 +15,28 @@ const (
 	kindLoaded
 )
 
+// KeyState is returned from cache operations to indicate how a key existed in
+// the map, if at all.
+type KeyState uint8
+
+// IsHit returns whether the key state is Hit or Stale, meaning that the value
+// is loaded.
+func (s KeyState) IsHit() bool { return s != Miss }
+
+// IsMiss returns if the key state is Miss.
+func (s KeyState) IsMiss() bool { return s == Miss }
+
+const (
+	// Miss indicates that the key was not present in the map.
+	Miss KeyState = iota
+	// Hit indicates that the key was present in the map and we are using
+	// the latest values for the key.
+	Hit
+	// Stale indicates that the key was present in the map, but either was
+	// expired or had an error, and we returned a valid stale value.
+	Stale
+)
+
 type (
 	stale[V any] struct {
 		v       V
@@ -27,16 +49,18 @@ type (
 		kind    uint8 // == kindLoaded
 		v       V
 		err     error
-		expires int64 // nano at which this ent is unusable, if non-zero
+		expires int64     // nano at which this ent is unusable, if non-zero
+		stale   *stale[V] // *stale[V]
 	}
 	loading[V any] struct {
 		kind     uint8 // == kindLoading
 		done     chan struct{}
 		override chan V
+		stale    *stale[V] // *stale[V]
+		loaded   *loaded[V]
 	}
 	ent[V any] struct {
-		p     unsafe.Pointer // [nil | promotingDelete | *loading | *loaded]
-		stale *stale[V]
+		p unsafe.Pointer // [nil | promotingDelete | *loading | *loaded]
 	}
 	read[K comparable, V any] struct {
 		m          map[K]*ent[V]
@@ -133,10 +157,10 @@ func New[K comparable, V any](opts ...Opt) *Cache[K, V] {
 // if the key is not yet cached. If stale values are enabled, the currently
 // cached value has an error, and there is an unexpired stale value, this
 // returns the stale value and no error.
-func (c *Cache[K, V]) Get(k K, miss func() (V, error)) (v V, err error, hit bool) {
+func (c *Cache[K, V]) Get(k K, miss func() (V, error)) (v V, err error, s KeyState) {
 	r := c.read()
 	e := r.m[k]
-	if v, err, hit = e.get(); hit {
+	if v, err, s = e.get(); s == Hit {
 		return
 	}
 
@@ -145,7 +169,7 @@ func (c *Cache[K, V]) Get(k K, miss func() (V, error)) (v V, err error, hit bool
 	c.mu.Lock()
 	r = c.read()
 	e = r.m[k]
-	if v, err, hit = e.get(); hit {
+	if v, err, s = e.get(); s == Hit {
 		c.mu.Unlock()
 		return
 	}
@@ -157,7 +181,7 @@ func (c *Cache[K, V]) Get(k K, miss func() (V, error)) (v V, err error, hit bool
 		e = c.dirty[k]
 		c.missed(r)
 		r = c.read()
-		if v, err, hit = e.get(); hit {
+		if v, err, s = e.get(); s == Hit {
 			c.mu.Unlock()
 			return
 		}
@@ -167,6 +191,7 @@ func (c *Cache[K, V]) Get(k K, miss func() (V, error)) (v V, err error, hit bool
 		kind:     kindLoading,
 		done:     make(chan struct{}),
 		override: make(chan V),
+		stale:    e.maybeNewStale(c.cfg.maxStaleAge),
 	}
 
 	// If we have no entry, this is completely new. If we had an entry, it
@@ -179,30 +204,51 @@ func (c *Cache[K, V]) Get(k K, miss func() (V, error)) (v V, err error, hit bool
 	if e != nil {
 		atomic.StorePointer(&e.p, unsafe.Pointer(loading))
 	} else {
-		e = &ent[V]{
-			p:     unsafe.Pointer(loading),
-			stale: e.maybeNewStale(c.cfg.maxStaleAge),
-		}
+		e = &ent[V]{p: unsafe.Pointer(loading)}
 		c.storeDirty(r, k, e)
 	}
 	c.mu.Unlock()
 
-	c.loadEnt(k, e, loading, func() (V, error) {
+	// If our expiry's are so small, it is possible that we could expire
+	// before `get` runs below. If this is the case, we still want to
+	// return what the actual miss values were. We do some closure magic:
+	// capture the miss returns, and also use that for the value we save
+	// (which could expire immediately).
+	var vmiss V
+	var emiss error
+
+	go c.loadEnt(k, e, loading, func() (V, error) {
 		done := make(chan struct{})
+		var (
+			v   V
+			err error
+		)
 		go func() {
 			defer close(done)
 			v, err = miss()
 		}()
 
 		select {
-		case v = <-loading.override:
-			return v, nil
+		case o := <-loading.override:
+			vmiss = o
+			return o, nil
 		case <-done:
+			vmiss, emiss = v, err
 			return v, err
 		}
 	})
-	<-loading.done
-	return
+
+	// We could have set our own stale value which can be returned
+	// immediately rather than waiting for the get. If there is a valid
+	// stale to be returned now, `get` returns it. If `get` returns a Hit,
+	// we ended up waiting for ourself and we return a miss. There should
+	// be no Miss returns from `get`.
+	v, err, s = e.get()
+	switch s {
+	case Miss, Hit:
+		return vmiss, emiss, Miss
+	}
+	return v, err, Stale
 }
 
 func (c *Cache[K, V]) tryLoadEnt(k K, dirty func()) *ent[V] {
@@ -228,14 +274,14 @@ func (c *Cache[K, V]) tryLoadEnt(k K, dirty func()) *ent[V] {
 // either the currently loaded value, or if the current load has an error, the
 // stale value if present, or the currently stored error. If nothing is cached,
 // or what is cached is expired, this returns false.
-func (c *Cache[K, V]) TryGet(k K) (V, error, bool) {
+func (c *Cache[K, V]) TryGet(k K) (V, error, KeyState) {
 	e := c.tryLoadEnt(k, nil)
 	return e.tryGet()
 }
 
 // Delete deletes the value for a key and returns the prior value, if loaded
 // (i.e. the return from TryGet).
-func (c *Cache[K, V]) Delete(k K) (V, error, bool) {
+func (c *Cache[K, V]) Delete(k K) (V, error, KeyState) {
 	e := c.tryLoadEnt(k, func() { delete(c.dirty, k) })
 	defer e.del()
 	return e.tryGet()
@@ -250,21 +296,14 @@ func (c *Cache[K, V]) Expire(k K) {
 	if loaded == nil {
 		return
 	}
-	now := now()
-	for {
-		expires := atomic.LoadInt64(&loaded.expires)
-		if expires < now {
-			return
-		}
-		atomic.CompareAndSwapInt64(&loaded.expires, expires, now)
-	}
+	atomic.SwapInt64(&loaded.expires, now())
 }
 
 // Each calls fn for every cached value. If fn returns false, iteration stops.
-func (c *Cache[K, V]) Each(fn func(K, V, error) bool) {
+func (c *Cache[K, V]) Range(fn func(K, V, error) bool) {
 	c.each(func(k K, e *ent[V]) bool {
-		v, err, ok := e.tryGet()
-		if !ok {
+		v, err, s := e.tryGet()
+		if s.IsMiss() {
 			return true
 		}
 		return fn(k, v, err)
@@ -292,20 +331,21 @@ func (c *Cache[K, V]) each(fn func(K, *ent[V]) bool) {
 }
 
 // Clean deletes all expired values from the cache. A value is expired if
-// MaxAge is used and the entry is older than the max age. If MaxStaleAge is
-// also used and not -1, the entry must be older than MaxAge + MaxStaleAge.
+// MaxAge is used and the entry is older than the max age, or if you manually
+// expired a key. If MaxStaleAge is used and not -1, the entry must be older
+// than MaxAge + MaxStaleAge. If MaxStaleAge is -1, Clean returns immediately.
 func (c *Cache[K, V]) Clean() {
-	// If no age has been set, we persist forever; if MaxStaleAge is -1,
-	// the user opted into persisting stales forever and we do not clean.
-	if !c.cfg.ageSet || c.cfg.maxStaleAge < 0 {
+	// If MaxStaleAge is -1, the user opted into persisting stales forever
+	// and we do not clean.
+	if c.cfg.maxStaleAge < 0 {
 		return
 	}
 	now := now()
 	c.each(func(k K, e *ent[V]) bool {
 		_, loaded := e.load()
 		if loaded != nil {
-			expires := atomic.LoadInt64(&loaded.expires) + int64(c.cfg.maxStaleAge)
-			if now > expires {
+			expires := atomic.LoadInt64(&loaded.expires)
+			if expires != 0 && now > expires+int64(c.cfg.maxStaleAge) {
 				c.Delete(k)
 			}
 		}
@@ -321,9 +361,16 @@ func (c *Cache[K, V]) Set(k K, v V) {
 		v:       v,
 		expires: c.cfg.newExpires(nil),
 	}
+	if c.cfg.maxStaleAge != 0 {
+		loaded.stale = newStale(v, now(), c.cfg.maxStaleAge)
+	}
 	p := unsafe.Pointer(loaded)
 
 	var was unsafe.Pointer
+
+	r := c.read()
+	e, ok := r.m[k]
+
 	defer func() {
 		if was == nil {
 			return
@@ -336,8 +383,7 @@ func (c *Cache[K, V]) Set(k K, v V) {
 		}
 	}()
 
-	r := c.read()
-	if e, ok := r.m[k]; ok {
+	if ok {
 		for {
 			rm := atomic.LoadPointer(&e.p)
 			if rm == promotingDelete { // deleted & currently being ignored in a promote
@@ -352,9 +398,9 @@ func (c *Cache[K, V]) Set(k K, v V) {
 
 	c.mu.Lock()
 	r = c.read()
-	if e := r.m[k]; e != nil {
-		was = atomic.SwapPointer(&e.p, p)
-	} else if e := c.dirty[k]; e != nil {
+	if e = r.m[k]; e != nil {
+		was = atomic.SwapPointer(&e.p, p) // was not in read, but promoted by the time we entered the lock and is now in read
+	} else if e = c.dirty[k]; e != nil {
 		was = atomic.SwapPointer(&e.p, p)
 	} else {
 		c.storeDirty(r, k, &ent[V]{p: p})
@@ -374,6 +420,8 @@ func (c *Cache[K, V]) loadEnt(k K, e *ent[V], loading *loading[V], fn func() (V,
 	loaded := &loaded[V]{kind: kindLoaded}
 	loaded.v, loaded.err = fn()
 	loaded.expires = c.cfg.newExpires(loaded.err)
+	loaded.stale = loading.stale
+	loading.loaded = loaded
 
 	// If we cannot swap this value in, something else Set over us.
 	atomic.CompareAndSwapPointer(&e.p, unsafe.Pointer(loading), unsafe.Pointer(loaded))
@@ -427,8 +475,8 @@ func (c *Cache[K, V]) promote() {
 	keep = make(map[K]*ent[V], len(keep)+len(c.dirty))
 	for k, e := range c.dirty {
 		keep[k] = e
-		delete(c.dirty, k)
 	}
+	c.dirty = nil
 
 outer:
 	for k, e := range r.m {
@@ -437,7 +485,7 @@ outer:
 			if atomic.CompareAndSwapPointer(&e.p, nil, promotingDelete) {
 				continue outer
 			}
-			p = atomic.LoadPointer(&e.p)
+			p = atomic.LoadPointer(&e.p) // concurrently deleted while promoting
 		}
 		if p != promotingDelete {
 			keep[k] = e
@@ -466,11 +514,9 @@ func (e *ent[V]) del() {
 
 func pointerToLoad[V any](p unsafe.Pointer) (*loading[V], *loaded[V]) {
 	switch ((*lcheck)(p)).kind {
-	default:
-		return nil, nil
 	case kindLoading:
 		return (*loading[V])(p), nil
-	case kindLoaded:
+	default: // kindLoading, only other option
 		return nil, (*loaded[V])(p)
 	}
 }
@@ -484,14 +530,6 @@ func (e *ent[V]) load() (*loading[V], *loaded[V]) {
 		return nil, nil
 	}
 	return pointerToLoad[V](p)
-}
-
-func (e *ent[V]) expired(now int64) bool {
-	_, loaded := e.load()
-	if loaded != nil {
-		return loaded.expired(now)
-	}
-	return false
 }
 
 func (l *loaded[V]) expired(now int64) bool {
@@ -516,61 +554,93 @@ func (e *ent[V]) maybeNewStale(age time.Duration) *stale[V] {
 	if e == nil || age == 0 {
 		return nil
 	}
-	// If e is non-nil, we are only in this func because e.expired is true,
-	// meaning the value is loaded and the fields are immutable. We can
-	// read all fields.
 	_, loaded := e.load()
-	if loaded == nil || loaded.err != nil {
-		return e.stale
+	if loaded == nil {
+		return nil
 	}
+	if loaded.err != nil {
+		return loaded.stale
+	}
+	return newStale(loaded.v, loaded.expires, age)
+}
+
+// Actually returns the stale; age must be non-zero.
+func newStale[V any](v V, expires int64, age time.Duration) *stale[V] {
 	if age < 0 {
-		return &stale[V]{v: loaded.v}
+		return &stale[V]{v: v}
 	}
-	return &stale[V]{loaded.v, loaded.expires + int64(age)}
+	return &stale[V]{v, expires + int64(age)}
 }
 
 // get always returns the value or the stale value. We do not check if our
 // value is expired: we call this at the end of Get, we must always return
 // something even if it is to be immediately expired.
-func (e *ent[V]) get() (v V, err error, got bool) {
+func (e *ent[V]) get() (v V, err error, s KeyState) {
 	loading, loaded := e.load()
+	var waited bool
 	if loading != nil {
-		if e.stale != nil && !e.stale.expired(now()) {
-			return e.stale.v, nil, true
+		if loading.stale != nil && !loading.stale.expired(now()) {
+			return loading.stale.v, nil, Stale
 		}
 		<-loading.done
-		_, loaded = e.load()
-	}
-	if loaded == nil {
+		loaded = loading.loaded
+		waited = true
+	} else if loaded == nil {
+		// No loading nor loaded: entry could be nil if deleted while
+		// in the read map, or promotingDelete.
 		return
 	}
-	if loaded.err != nil && e.stale != nil && !e.stale.expired(now()) {
-		return e.stale.v, nil, true
+
+	// If we did not wait and our entry is expired (value or error), or if
+	// our entry is not expired but has errored, we potentially return the
+	// stale entry.
+	//
+	// If we waited, we could immediately be expired due to time sync, or
+	// if the user is configured to never cache and they're just using
+	// request collapsing: we still want to return the now expired value.
+	now := now()
+	if !waited && loaded.expired(now) || loaded.err != nil {
+		if loaded.stale != nil && !loaded.stale.expired(now) {
+			return loaded.stale.v, nil, Stale
+		}
+		// The stale value is expired: if our entry is not expired,
+		// this must be an error we waited on.
+		if !loaded.expired(now) {
+			return loaded.v, loaded.err, Hit
+		}
+		return
 	}
-	return loaded.v, loaded.err, true
+	return loaded.v, loaded.err, Hit
 }
 
-func (e *ent[V]) tryGet() (v V, err error, b bool) {
+func (e *ent[V]) tryGet() (v V, err error, s KeyState) {
 	if e == nil {
 		return
 	}
+	loading, loaded := e.load()
 	now := now()
-	_, loaded := e.load()
-	if loaded == nil || loaded.expired(now) { // not loaded, or e expired
-		if e.stale != nil && !e.stale.expired(now) {
-			return e.stale.v, nil, true
+	// If we are loading but there is a valid stale, return it, otherwise
+	// return immediately: no get.
+	if loading != nil {
+		if loading.stale != nil && !loading.stale.expired(now) {
+			return loading.stale.v, nil, Stale
 		}
-		return // no stale, or stale expired
+		return
 	}
-	if loaded.err != nil && e.stale != nil && !e.stale.expired(now) {
-		return e.stale.v, nil, true // have error and not-expired stale
+	// If not loading and not loaded, this is either deleted or
+	// promotingDelete.
+	if loaded == nil {
+		return
 	}
-	return loaded.v, loaded.err, true
-}
 
-// available returns true if an entry has a non-erroring value or a stale
-// value. This returns true in the same cases that tryGet would return true.
-func (e *ent[V]) available(when int64) bool {
-	_, loaded := e.load()
-	return e != nil && (loaded != nil && !loaded.expired(when) || e.stale != nil && !e.stale.expired(when))
+	// If we have an error or we are expired, we maybe return the stale.
+	if loaded.err != nil || loaded.expired(now) {
+		if loaded.stale != nil && !loaded.stale.expired(now) {
+			return loaded.stale.v, nil, Stale
+		}
+	}
+	if loaded.expired(now) {
+		return
+	}
+	return loaded.v, loaded.err, Hit
 }
