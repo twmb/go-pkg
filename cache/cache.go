@@ -214,9 +214,6 @@ func (c *Cache[K, V]) Get(k K, miss func() (V, error)) (v V, err error, s KeySta
 	// return what the actual miss values were. We do some closure magic:
 	// capture the miss returns, and also use that for the value we save
 	// (which could expire immediately).
-	var vmiss V
-	var emiss error
-
 	go c.loadEnt(k, e, loading, func() (V, error) {
 		done := make(chan struct{})
 		var (
@@ -230,10 +227,8 @@ func (c *Cache[K, V]) Get(k K, miss func() (V, error)) (v V, err error, s KeySta
 
 		select {
 		case o := <-loading.override:
-			vmiss = o
 			return o, nil
 		case <-done:
-			vmiss, emiss = v, err
 			return v, err
 		}
 	})
@@ -246,7 +241,7 @@ func (c *Cache[K, V]) Get(k K, miss func() (V, error)) (v V, err error, s KeySta
 	v, err, s = e.get()
 	switch s {
 	case Miss, Hit:
-		return vmiss, emiss, Miss
+		return loading.loaded.v, loading.loaded.err, Miss
 	}
 	return v, err, Stale
 }
