@@ -99,8 +99,8 @@ type CacheMap[K comparable] struct {
 }
 
 func (c *CacheMap[K]) Load(key K) (value any, ok bool) {
-	v, _, ok := c.c.TryGet(key)
-	return v, ok
+	v, _, s := c.c.TryGet(key)
+	return v, s.IsHit()
 }
 
 func (c *CacheMap[K]) Store(key K, value any) {
@@ -108,15 +108,15 @@ func (c *CacheMap[K]) Store(key K, value any) {
 }
 
 func (c *CacheMap[K]) LoadOrStore(key K, value any) (actual any, loaded bool) {
-	actual, _, loaded = c.c.Get(key, func() (any, error) {
+	actual, _, s := c.c.Get(key, func() (any, error) {
 		return value, nil
 	})
-	return
+	return actual, s.IsHit()
 }
 
 func (c *CacheMap[K]) LoadAndDelete(key K) (value any, loaded bool) {
-	value, _, loaded = c.c.Delete(key)
-	return
+	value, _, s := c.c.Delete(key)
+	return value, s.IsHit()
 }
 
 func (c *CacheMap[K]) Delete(key K) {
@@ -124,7 +124,7 @@ func (c *CacheMap[K]) Delete(key K) {
 }
 
 func (c *CacheMap[K]) Range(f func(key K, value any) (shouldContinue bool)) {
-	c.c.Each(func(k K, v any, _ error) bool {
+	c.c.Range(func(k K, v any, _ error) bool {
 		return f(k, v)
 	})
 }

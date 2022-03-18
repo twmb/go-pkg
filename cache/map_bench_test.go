@@ -17,7 +17,7 @@ type bench struct {
 }
 
 func benchMap(b *testing.B, bench bench) {
-	for _, m := range [...]mapInterface[int]{&RWMutexMap[int]{}, &CacheMap[int]{}} {
+	for _, m := range [...]mapInterface[int]{&CacheMap[int]{}} {
 		b.Run(fmt.Sprintf("%T", m), func(b *testing.B) {
 			m = reflect.New(reflect.TypeOf(m).Elem()).Interface().(mapInterface[int])
 			if bench.setup != nil {
