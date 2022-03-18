@@ -53,11 +53,16 @@ type (
 		stale   *stale[V] // *stale[V]
 	}
 	loading[V any] struct {
-		kind     uint8 // == kindLoading
-		done     chan struct{}
-		override chan V
-		stale    *stale[V] // *stale[V]
-		loaded   *loaded[V]
+		kind uint8 // == kindLoading
+		wg   sync.WaitGroup
+
+		wgmiss sync.WaitGroup
+		once   sync.Once
+		v      V
+		err    error
+
+		stale  *stale[V] // *stale[V]
+		loaded *loaded[V]
 	}
 	ent[V any] struct {
 		p unsafe.Pointer // [nil | promotingDelete | *loading | *loaded]
@@ -188,11 +193,11 @@ func (c *Cache[K, V]) Get(k K, miss func() (V, error)) (v V, err error, s KeySta
 	}
 
 	loading := &loading[V]{
-		kind:     kindLoading,
-		done:     make(chan struct{}),
-		override: make(chan V),
-		stale:    e.maybeNewStale(c.cfg.maxStaleAge),
+		kind:  kindLoading,
+		stale: e.maybeNewStale(c.cfg.maxStaleAge),
 	}
+	loading.wg.Add(1)
+	loading.wgmiss.Add(1)
 
 	// If we have no entry, this is completely new. If we had an entry, it
 	// was in the read map and not yet deleted through promotion. We know
@@ -214,24 +219,7 @@ func (c *Cache[K, V]) Get(k K, miss func() (V, error)) (v V, err error, s KeySta
 	// return what the actual miss values were. We do some closure magic:
 	// capture the miss returns, and also use that for the value we save
 	// (which could expire immediately).
-	go c.loadEnt(k, e, loading, func() (V, error) {
-		done := make(chan struct{})
-		var (
-			v   V
-			err error
-		)
-		go func() {
-			defer close(done)
-			v, err = miss()
-		}()
-
-		select {
-		case o := <-loading.override:
-			return o, nil
-		case <-done:
-			return v, err
-		}
-	})
+	go c.loadEnt(k, e, loading, miss)
 
 	// We could have set our own stale value which can be returned
 	// immediately rather than waiting for the get. If there is a valid
@@ -371,10 +359,7 @@ func (c *Cache[K, V]) Set(k K, v V) {
 			return
 		}
 		if loading, _ := pointerToLoad[V](was); loading != nil {
-			select {
-			case loading.override <- v:
-			case <-loading.done:
-			}
+			loading.setve(v, nil)
 		}
 	}()
 
@@ -403,8 +388,15 @@ func (c *Cache[K, V]) Set(k K, v V) {
 	c.mu.Unlock()
 }
 
-func (c *Cache[K, V]) loadEnt(k K, e *ent[V], loading *loading[V], fn func() (V, error)) {
-	defer close(loading.done)
+func (l *loading[V]) setve(v V, err error) {
+	l.once.Do(func() {
+		l.v, l.err = v, err
+		l.wgmiss.Done()
+	})
+}
+
+func (c *Cache[K, V]) loadEnt(k K, e *ent[V], loading *loading[V], miss func() (V, error)) {
+	defer loading.wg.Done()
 
 	// We have created a new entry: we run miss. If we are configured to
 	// not cache, we clear this entry upon return.
@@ -412,8 +404,11 @@ func (c *Cache[K, V]) loadEnt(k K, e *ent[V], loading *loading[V], fn func() (V,
 		defer c.Delete(k)
 	}
 
+	go func() { loading.setve(miss()) }()
+	loading.wgmiss.Wait()
+
 	loaded := &loaded[V]{kind: kindLoaded}
-	loaded.v, loaded.err = fn()
+	loaded.v, loaded.err = loading.v, loading.err
 	loaded.expires = c.cfg.newExpires(loaded.err)
 	loaded.stale = loading.stale
 	loading.loaded = loaded
@@ -577,7 +572,7 @@ func (e *ent[V]) get() (v V, err error, s KeyState) {
 		if loading.stale != nil && !loading.stale.expired(now()) {
 			return loading.stale.v, nil, Stale
 		}
-		<-loading.done
+		loading.wg.Wait()
 		loaded = loading.loaded
 		waited = true
 	} else if loaded == nil {
