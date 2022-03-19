@@ -239,7 +239,7 @@ func (c *Cache[K, V]) tryLoadEnt(k K, dirty func()) *ent[V] {
 // or what is cached is expired, this returns false.
 func (c *Cache[K, V]) TryGet(k K) (V, error, KeyState) {
 	e := c.tryLoadEnt(k, nil)
-	return e.tryGet()
+	return e.tryGet(0)
 }
 
 // Delete deletes the value for a key and returns the prior value, if loaded
@@ -247,7 +247,7 @@ func (c *Cache[K, V]) TryGet(k K) (V, error, KeyState) {
 func (c *Cache[K, V]) Delete(k K) (V, error, KeyState) {
 	e := c.tryLoadEnt(k, func() { delete(c.dirty, k) })
 	defer e.del()
-	return e.tryGet()
+	return e.tryGet(0)
 }
 
 // Expire sets a loaded value to expire immediately, meaning the next Get will
@@ -262,8 +262,11 @@ func (c *Cache[K, V]) Expire(k K) {
 
 // Each calls fn for every cached value. If fn returns false, iteration stops.
 func (c *Cache[K, V]) Range(fn func(K, V, error) bool) {
+	// When ranging, repeated time.Now() calls add up, so we get the
+	// current time when we enter range and avoid it in all tryGet calls.
+	now := now()
 	c.each(func(k K, e *ent[V]) bool {
-		v, err, s := e.tryGet()
+		v, err, s := e.tryGet(now)
 		if s.IsMiss() {
 			return true
 		}
@@ -556,7 +559,7 @@ func (e *ent[V]) get() (v V, err error, s KeyState) {
 	return l.v, l.err, Hit
 }
 
-func (e *ent[V]) tryGet() (v V, err error, s KeyState) {
+func (e *ent[V]) tryGet(n64 int64) (v V, err error, s KeyState) {
 	if e == nil {
 		return
 	}
@@ -565,7 +568,11 @@ func (e *ent[V]) tryGet() (v V, err error, s KeyState) {
 		return
 	}
 
-	now := now()
+	if n64 == 0 {
+		n64 = now()
+	}
+	now := n64
+
 	// If we are loading but there is a valid stale, return it, otherwise
 	// return immediately: no get.
 	if !l.finalized() {
